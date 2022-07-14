@@ -17,13 +17,18 @@ limitations under the License.
 package backup
 
 import (
+	"context"
+	"fmt"
+	snapshotv1api "github.com/kubernetes-csi/external-snapshotter/client/v4/apis/volumesnapshot/v1"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
+	corev1api "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
-	snapshotv1beta1api "github.com/kubernetes-csi/external-snapshotter/client/v4/apis/volumesnapshot/v1beta1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 
+	datamoverv1alpha1 "github.com/konveyor/volume-snapshot-mover/api/v1alpha1"
 	"github.com/vmware-tanzu/velero-plugin-for-csi/internal/util"
 	velerov1api "github.com/vmware-tanzu/velero/pkg/apis/velero/v1"
 	"github.com/vmware-tanzu/velero/pkg/plugin/velero"
@@ -37,7 +42,7 @@ type VolumeSnapshotContentBackupItemAction struct {
 
 // AppliesTo returns information indicating that the VolumeSnapshotContentBackupItemAction action should be invoked to backup volumesnapshotcontents.
 func (p *VolumeSnapshotContentBackupItemAction) AppliesTo() (velero.ResourceSelector, error) {
-	p.Log.Debug("VolumeSnapshotBackupItemAction AppliesTo")
+	p.Log.Debug("VolumeSnapshotContentBackupItemAction AppliesTo")
 
 	return velero.ResourceSelector{
 		IncludedResources: []string{"volumesnapshotcontent.snapshot.storage.k8s.io"},
@@ -49,9 +54,58 @@ func (p *VolumeSnapshotContentBackupItemAction) AppliesTo() (velero.ResourceSele
 func (p *VolumeSnapshotContentBackupItemAction) Execute(item runtime.Unstructured, backup *velerov1api.Backup) (runtime.Unstructured, []velero.ResourceIdentifier, error) {
 	p.Log.Infof("Executing VolumeSnapshotContentBackupItemAction")
 
-	var snapCont snapshotv1beta1api.VolumeSnapshotContent
+	var snapCont snapshotv1api.VolumeSnapshotContent
 	if err := runtime.DefaultUnstructuredConverter.FromUnstructured(item.UnstructuredContent(), &snapCont); err != nil {
 		return nil, nil, errors.WithStack(err)
+	}
+
+	_, snapshotClient, err := util.GetClients()
+	if err != nil {
+		return nil, nil, errors.WithStack(err)
+	}
+
+	// Wait for VSC to be in ready state
+	VSCReady, err := util.WaitForVolumeSnapshotContentToBeReady(snapCont, snapshotClient.SnapshotV1(), p.Log)
+
+	if err != nil {
+		return nil, nil, errors.WithStack(err)
+	}
+
+	if !VSCReady {
+		p.Log.Infof("volumesnapshotcontent not in ready state, still continuing with the backup")
+	}
+
+	// craft a  VolumeBackupSnapshot object to be created
+	vsb := datamoverv1alpha1.VolumeSnapshotBackup{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      fmt.Sprint("vsb-" + snapCont.Spec.VolumeSnapshotRef.Name),
+			Namespace: snapCont.Spec.VolumeSnapshotRef.Namespace,
+		},
+		Spec: datamoverv1alpha1.VolumeSnapshotBackupSpec{
+			VolumeSnapshotContent: corev1api.ObjectReference{
+				Name: snapCont.Name,
+			},
+			ProtectedNamespace: backup.Namespace,
+		},
+	}
+
+	// check if VolumeBackupSnapshot CR exists for VSC
+	VSBExists, err := util.DoesVolumeSnapshotBackupExistForVSC(&snapCont, p.Log)
+	if err != nil {
+		return nil, nil, errors.WithStack(err)
+	}
+
+	// Create VSB only if does not exist for the VSC
+	if !VSBExists {
+		vsbClient, err := util.GetVolumeSnapshotMoverClient()
+
+		err = vsbClient.Create(context.Background(), &vsb)
+
+		if err != nil {
+			return nil, nil, errors.Wrapf(err, "error creating volumesnapshotbackup CR")
+		}
+
+		p.Log.Infof("Created volumesnapshotbackup %s", fmt.Sprintf("%s/%s", vsb.Namespace, vsb.Name))
 	}
 
 	additionalItems := []velero.ResourceIdentifier{}
@@ -65,6 +119,13 @@ func (p *VolumeSnapshotContentBackupItemAction) Execute(item runtime.Unstructure
 			Namespace:     snapCont.Annotations[util.PrefixedSnapshotterSecretNamespaceKey],
 		})
 	}
+
+	// adding volumesnapshotbackup instance as an additional item, need to block the plugin execution till VSB CR is recon complete
+	additionalItems = append(additionalItems, velero.ResourceIdentifier{
+		GroupResource: schema.GroupResource{Group: "datamover.oadp.openshift.io", Resource: "volumesnapshotbackup"},
+		Name:          vsb.Name,
+		Namespace:     vsb.Namespace,
+	})
 
 	p.Log.Infof("Returning from VolumeSnapshotContentBackupItemAction with %d additionalItems to backup", len(additionalItems))
 	return item, additionalItems, nil

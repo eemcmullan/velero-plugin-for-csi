@@ -19,15 +19,18 @@ package util
 import (
 	"context"
 	"fmt"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/config"
 	"strings"
 	"time"
 
+	snapshotv1api "github.com/kubernetes-csi/external-snapshotter/client/v4/apis/volumesnapshot/v1"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 
-	snapshotv1beta1api "github.com/kubernetes-csi/external-snapshotter/client/v4/apis/volumesnapshot/v1beta1"
 	snapshotterClientSet "github.com/kubernetes-csi/external-snapshotter/client/v4/clientset/versioned"
-	snapshotter "github.com/kubernetes-csi/external-snapshotter/client/v4/clientset/versioned/typed/volumesnapshot/v1beta1"
+	snapshotter "github.com/kubernetes-csi/external-snapshotter/client/v4/clientset/versioned/typed/volumesnapshot/v1"
 	corev1api "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -36,6 +39,7 @@ import (
 	corev1client "k8s.io/client-go/kubernetes/typed/core/v1"
 	"k8s.io/client-go/tools/clientcmd"
 
+	datamoverv1alpha1 "github.com/konveyor/volume-snapshot-mover/api/v1alpha1"
 	velerov1api "github.com/vmware-tanzu/velero/pkg/apis/velero/v1"
 	"github.com/vmware-tanzu/velero/pkg/label"
 	"github.com/vmware-tanzu/velero/pkg/restic"
@@ -121,7 +125,7 @@ func IsPVCBackedUpByRestic(pvcNamespace, pvcName string, podClient corev1client.
 }
 
 // GetVolumeSnapshotClassForStorageClass returns a VolumeSnapshotClass for the supplied volume provisioner/ driver name.
-func GetVolumeSnapshotClassForStorageClass(provisioner string, snapshotClient snapshotter.SnapshotV1beta1Interface) (*snapshotv1beta1api.VolumeSnapshotClass, error) {
+func GetVolumeSnapshotClassForStorageClass(provisioner string, snapshotClient snapshotter.SnapshotV1Interface) (*snapshotv1api.VolumeSnapshotClass, error) {
 	snapshotClasses, err := snapshotClient.VolumeSnapshotClasses().List(context.TODO(), metav1.ListOptions{})
 	if err != nil {
 		return nil, errors.Wrap(err, "error listing volumesnapshot classes")
@@ -129,7 +133,7 @@ func GetVolumeSnapshotClassForStorageClass(provisioner string, snapshotClient sn
 	// We pick the volumesnapshotclass that matches the CSI driver name and has a 'velero.io/csi-volumesnapshot-class'
 	// label. This allows multiple VolumesnapshotClasses for the same driver with different values for the
 	// other fields in the spec.
-	// https://pkg.go.dev/github.com/kubernetes-csi/external-snapshotter/v2@v2.0.1/pkg/apis/volumesnapshot/v1beta1?tab=doc#VolumeSnapshotClass
+	// https://github.com/kubernetes-csi/external-snapshotter/blob/release-4.2/client/config/crd/snapshot.storage.k8s.io_volumesnapshotclasses.yaml
 	for _, sc := range snapshotClasses.Items {
 		_, hasLabelSelector := sc.Labels[VolumeSnapshotClassSelectorLabel]
 		if sc.Driver == provisioner && hasLabelSelector {
@@ -140,7 +144,7 @@ func GetVolumeSnapshotClassForStorageClass(provisioner string, snapshotClient sn
 }
 
 // GetVolumeSnapshotContentForVolumeSnapshot returns the volumesnapshotcontent object associated with the volumesnapshot
-func GetVolumeSnapshotContentForVolumeSnapshot(volSnap *snapshotv1beta1api.VolumeSnapshot, snapshotClient snapshotter.SnapshotV1beta1Interface, log logrus.FieldLogger, shouldWait bool) (*snapshotv1beta1api.VolumeSnapshotContent, error) {
+func GetVolumeSnapshotContentForVolumeSnapshot(volSnap *snapshotv1api.VolumeSnapshot, snapshotClient snapshotter.SnapshotV1Interface, log logrus.FieldLogger, shouldWait bool) (*snapshotv1api.VolumeSnapshotContent, error) {
 	if !shouldWait {
 		if volSnap.Status == nil || volSnap.Status.BoundVolumeSnapshotContentName == nil {
 			// volumesnapshot hasn't been reconciled and we're not waiting for it.
@@ -157,7 +161,7 @@ func GetVolumeSnapshotContentForVolumeSnapshot(volSnap *snapshotv1beta1api.Volum
 	// TODO: make this timeout configurable.
 	timeout := 10 * time.Minute
 	interval := 5 * time.Second
-	var snapshotContent *snapshotv1beta1api.VolumeSnapshotContent
+	var snapshotContent *snapshotv1api.VolumeSnapshotContent
 
 	err := wait.PollImmediate(interval, timeout, func() (bool, error) {
 		vs, err := snapshotClient.VolumeSnapshots(volSnap.Namespace).Get(context.TODO(), volSnap.Name, metav1.GetOptions{})
@@ -219,7 +223,7 @@ func GetClients() (*kubernetes.Clientset, *snapshotterClientSet.Clientset, error
 }
 
 // IsVolumeSnapshotClassHasListerSecret returns whether a volumesnapshotclass has a snapshotlister secret
-func IsVolumeSnapshotClassHasListerSecret(vc *snapshotv1beta1api.VolumeSnapshotClass) bool {
+func IsVolumeSnapshotClassHasListerSecret(vc *snapshotv1api.VolumeSnapshotClass) bool {
 	// https://github.com/kubernetes-csi/external-snapshotter/blob/master/pkg/utils/util.go#L59-L60
 	// There is no release w/ these constants exported. Using the strings for now.
 	_, nameExists := vc.Annotations[PrefixedSnapshotterListSecretNameKey]
@@ -228,7 +232,7 @@ func IsVolumeSnapshotClassHasListerSecret(vc *snapshotv1beta1api.VolumeSnapshotC
 }
 
 // IsVolumeSnapshotContentHasDeleteSecret returns whether a volumesnapshotcontent has a deletesnapshot secret
-func IsVolumeSnapshotContentHasDeleteSecret(vsc *snapshotv1beta1api.VolumeSnapshotContent) bool {
+func IsVolumeSnapshotContentHasDeleteSecret(vsc *snapshotv1api.VolumeSnapshotContent) bool {
 	// https://github.com/kubernetes-csi/external-snapshotter/blob/master/pkg/utils/util.go#L56-L57
 	// use exported constants in the next release
 	_, nameExists := vsc.Annotations[PrefixedSnapshotterSecretNameKey]
@@ -238,7 +242,7 @@ func IsVolumeSnapshotContentHasDeleteSecret(vsc *snapshotv1beta1api.VolumeSnapsh
 
 // IsVolumeSnapshotHasVSCDeleteSecret returns whether a volumesnapshot should set the deletesnapshot secret
 // for the static volumesnapshotcontent that is created on restore
-func IsVolumeSnapshotHasVSCDeleteSecret(vs *snapshotv1beta1api.VolumeSnapshot) bool {
+func IsVolumeSnapshotHasVSCDeleteSecret(vs *snapshotv1api.VolumeSnapshot) bool {
 	_, nameExists := vs.Annotations[CSIDeleteSnapshotSecretName]
 	_, nsExists := vs.Annotations[CSIDeleteSnapshotSecretNamespace]
 	return nameExists && nsExists
@@ -265,7 +269,7 @@ func AddLabels(o *metav1.ObjectMeta, vals map[string]string) {
 }
 
 // IsVolumeSnapshotExists returns whether a specific volumesnapshot object exists.
-func IsVolumeSnapshotExists(volSnap *snapshotv1beta1api.VolumeSnapshot, snapshotClient snapshotter.SnapshotV1beta1Interface) bool {
+func IsVolumeSnapshotExists(volSnap *snapshotv1api.VolumeSnapshot, snapshotClient snapshotter.SnapshotV1Interface) bool {
 	exists := false
 	if volSnap != nil {
 		vs, err := snapshotClient.VolumeSnapshots(volSnap.Namespace).Get(context.TODO(), volSnap.Name, metav1.GetOptions{})
@@ -277,7 +281,7 @@ func IsVolumeSnapshotExists(volSnap *snapshotv1beta1api.VolumeSnapshot, snapshot
 	return exists
 }
 
-func SetVolumeSnapshotContentDeletionPolicy(vscName string, csiClient snapshotter.SnapshotV1beta1Interface) error {
+func SetVolumeSnapshotContentDeletionPolicy(vscName string, csiClient snapshotter.SnapshotV1Interface) error {
 	pb := []byte(`{"spec":{"deletionPolicy":"Delete"}}`)
 	_, err := csiClient.VolumeSnapshotContents().Patch(context.TODO(), vscName, types.MergePatchType, pb, metav1.PatchOptions{})
 
@@ -289,4 +293,139 @@ func HasBackupLabel(o *metav1.ObjectMeta, backupName string) bool {
 		return false
 	}
 	return o.Labels[velerov1api.BackupNameLabel] == label.GetValidName(backupName)
+}
+
+// Get VolumeSnapshotBackup CR with complete status fields
+func GetVolumeSnapshotbackupWithCompletedStatus(volumeSnapshotbackupNS string, volumeSnapshotName string, log logrus.FieldLogger) (datamoverv1alpha1.VolumeSnapshotBackup, error) {
+
+	timeout := 10 * time.Minute
+	interval := 5 * time.Second
+	vsb := datamoverv1alpha1.VolumeSnapshotBackup{}
+
+	snapMoverClient, err := GetVolumeSnapshotMoverClient()
+	if err != nil {
+		return vsb, err
+	}
+
+	err = wait.PollImmediate(interval, timeout, func() (bool, error) {
+		err := snapMoverClient.Get(context.TODO(), client.ObjectKey{Namespace: volumeSnapshotbackupNS, Name: volumeSnapshotName}, &vsb)
+		if err != nil {
+			return false, errors.Wrapf(err, fmt.Sprintf("failed to get volumesnapshotbackup %s/%s", volumeSnapshotbackupNS, volumeSnapshotName))
+		}
+
+		if len(vsb.Status.Phase) == 0 || vsb.Status.Phase != datamoverv1alpha1.SnapMoverBackupPhaseCompleted {
+			log.Infof("Waiting for volumesnapshotbackup %s/%s to complete. Retrying in %ds", volumeSnapshotbackupNS, volumeSnapshotName, interval/time.Second)
+			return false, nil
+		}
+
+		return true, nil
+
+	})
+
+	if err != nil {
+		if err == wait.ErrWaitTimeout {
+			log.Errorf("Timed out awaiting reconciliation of volumesnapshotbackup %s/%s", volumeSnapshotbackupNS, volumeSnapshotName)
+		}
+		return vsb, err
+	}
+	log.Infof("Return VSB from GetVolumeSnapshotbackupWithCompletedStatus: %v", vsb)
+	return vsb, nil
+}
+
+// Check if volumesnapshotbackup CR exists for a given volumesnapshotcontent
+func DoesVolumeSnapshotBackupExistForVSC(snapCont *snapshotv1api.VolumeSnapshotContent, log logrus.FieldLogger) (bool, error) {
+	snapMoverClient, err := GetVolumeSnapshotMoverClient()
+	if err != nil {
+		return false, err
+	}
+	vsb := datamoverv1alpha1.VolumeSnapshotBackup{}
+
+	err = snapMoverClient.Get(context.TODO(), client.ObjectKey{Namespace: snapCont.Spec.VolumeSnapshotRef.Namespace, Name: fmt.Sprint("vsb-" + snapCont.Spec.VolumeSnapshotRef.Name)}, &vsb)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			log.Infof("could not find volumesnapshotbackup for the given volumesnapshotcontent")
+			return false, nil
+		}
+		return false, err
+	}
+
+	if len(vsb.Spec.VolumeSnapshotContent.Name) > 0 && vsb.Spec.VolumeSnapshotContent.Name == snapCont.Name {
+		log.Infof("found volumesnapshotbackup for the given volumesnapshotcontent")
+		return true, nil
+	}
+	log.Infof("could not find volumesnapshotbackup for the given volumesnapshotcontent")
+	return false, err
+}
+
+// block until replicationDestination is completed to use that snaphandle
+func GetVolumeSnapshotRestoreWithCompletedStatus(volumeSnapshotNS string, volumeSnapshotRestoreName string, protectedNS string, log logrus.FieldLogger) (bool, error) {
+
+	timeout := 10 * time.Minute
+	interval := 5 * time.Second
+
+	vsr := datamoverv1alpha1.VolumeSnapshotRestore{}
+	snapMoverClient, err := GetVolumeSnapshotMoverClient()
+	if err != nil {
+		return false, err
+	}
+
+	err = wait.PollImmediate(interval, timeout, func() (bool, error) {
+		err := snapMoverClient.Get(context.TODO(), client.ObjectKey{Namespace: volumeSnapshotNS, Name: volumeSnapshotRestoreName}, &vsr)
+		log.Infof("Inside IsVolumeSnapshotRestoreCompleted, Fetched VSR: %v/%v ", volumeSnapshotRestoreName, volumeSnapshotNS)
+		if err != nil {
+			return false, errors.Wrapf(err, fmt.Sprintf("failed to get volumesnapshotrestore %s", volumeSnapshotRestoreName))
+		}
+
+		if len(vsr.Status.SnapshotHandle) > 0 && vsr.Status.Phase == datamoverv1alpha1.SnapMoverRestorePhaseCompleted {
+			log.Infof("VSR %v has completed", volumeSnapshotRestoreName)
+			return true, nil
+		}
+		log.Infof("Waiting for volumesnapshotrestore %s/%s to complete. Retrying in %ds", volumeSnapshotRestoreName, volumeSnapshotNS, interval/time.Second)
+		return false, nil
+	})
+
+	if err != nil {
+		if err == wait.ErrWaitTimeout {
+			log.Errorf("Timed out awaiting reconciliation of volumesnapshotrestore %s", volumeSnapshotRestoreName)
+		}
+		return false, err
+	}
+	log.Infof("Returning from IsVolumeSnapshotRestoreCompleted as true: %v", vsr.Name)
+	return true, nil
+}
+
+//Waits for volumesnapshotcontent to be in ready state
+func WaitForVolumeSnapshotContentToBeReady(snapCont snapshotv1api.VolumeSnapshotContent, snapshotClient snapshotter.SnapshotV1Interface, log logrus.FieldLogger) (bool, error) {
+	// We'll wait 10m for the VSC to be reconciled polling every 5s
+	timeout := 10 * time.Minute
+	interval := 5 * time.Second
+	err := wait.PollImmediate(interval, timeout, func() (bool, error) {
+		updatedVSC, err := snapshotClient.VolumeSnapshotContents().Get(context.TODO(), snapCont.Name, metav1.GetOptions{})
+		if err != nil {
+			return false, errors.Wrapf(err, fmt.Sprintf("failed to get volumesnapshotcontent %s", updatedVSC.Name))
+		}
+		if updatedVSC.Status == nil || updatedVSC.Status.SnapshotHandle == nil || *updatedVSC.Status.ReadyToUse != true {
+			log.Infof("Waiting for volumesnapshotcontents %s to have snapshot handle and be ready. Retrying in %ds", snapCont.Name, interval/time.Second)
+			return false, nil
+		}
+
+		return true, nil
+	})
+	if err != nil {
+		if err == wait.ErrWaitTimeout {
+			log.Errorf("Timed out awaiting reconciliation of volumesnapshotcontent %s", snapCont.Name)
+		}
+		return false, err
+	}
+	return true, nil
+}
+
+func GetVolumeSnapshotMoverClient() (client.Client, error) {
+	client2, err := client.New(config.GetConfigOrDie(), client.Options{})
+	if err != nil {
+		return nil, err
+	}
+	datamoverv1alpha1.AddToScheme(client2.Scheme())
+
+	return client2, err
 }
